@@ -1,0 +1,18 @@
+/target
+.envrc.private
+*.duckdb
+*.parquet
+abacus-production
+**/logs/**
+.tmp
+duckdb-lib/
+
+# Sensitive
+duckpump.toml
+
+# Ignore generated credentials from google-github-actions/auth
+gha-creds-*.json
+# Added by goreleaser init:
+dist/
+.intentionally-empty-file.o
+target/
