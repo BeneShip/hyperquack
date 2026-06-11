@@ -1,8 +1,8 @@
 [package]
 name = "hyperquack"
-version.workspace = true
-edition.workspace = true
-authors.workspace = true
+version = "0.3.0"
+edition = "2024"
+authors = ["Jacob Elder <jacob.elder@paccurate.io>"]
 description = "HyperQuack: hyper-tenancy utilities for MotherDuck"
 
 [[bin]]
@@ -27,5 +27,3 @@ ureq = { version = "3.3.0", features = ["json"] }
 url = "2.5.8"
 urlencoding = "2.1.3"
 uuid = { version = "1.23.0", features = ["serde"] }
-
-
