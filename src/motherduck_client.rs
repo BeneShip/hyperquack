@@ -1,11 +1,14 @@
 use anyhow::{Context, Result};
 use bon::Builder;
 use serde::{Deserialize, Serialize};
+use std::sync::{Arc, Mutex};
 use std::{collections::HashMap, time::Duration};
 use suggest::Suggest;
 use time::OffsetDateTime;
 use ureq::Agent;
 use uuid::Uuid;
+
+use crate::token_cache::TokenCache;
 
 #[derive(Debug, Builder, Clone)]
 #[builder(on(String, into))]
@@ -14,9 +17,16 @@ pub struct MotherduckClient {
     pub region: String,
     #[builder(default = MotherduckClient::build_agent())]
     agent: Agent,
+    /// Best-effort local token cache. `None` disables caching (e.g. when the
+    /// cache file cannot be opened); the client then mints fresh tokens.
+    cache: Option<Arc<Mutex<TokenCache>>>,
 }
 
 pub static USER_AGENT: &str = "Paccurate HyperQuack";
+
+/// Lifetime requested for newly minted tokens. Long enough that the on-disk
+/// cache yields reuse across separate CLI runs within a work session.
+pub const DEFAULT_TTL: Duration = Duration::from_secs(86_400);
 
 impl MotherduckClient {
     fn build_agent() -> Agent {
@@ -85,6 +95,34 @@ impl MotherduckClient {
         }
     }
 
+    /// Return a token for `member`, reusing an unexpired cached one when
+    /// available and otherwise minting (and caching) a fresh one. All cache
+    /// interaction is best-effort: a poisoned lock or SQLite error is ignored
+    /// and we fall through to minting a new token.
+    pub fn token_for(
+        &self,
+        member: &Member,
+        token_type: TokenType,
+        ttl: Option<Duration>,
+    ) -> Result<String> {
+        if let Some(cache) = &self.cache
+            && let Ok(cache) = cache.lock()
+            && let Ok(Some(token)) = cache.get(&member.name, token_type)
+        {
+            return Ok(token);
+        }
+
+        let token = self.create_token(member, token_type, ttl)?;
+
+        if let Some(cache) = &self.cache
+            && let Ok(cache) = cache.lock()
+        {
+            let _ = cache.put(&member.name, token_type, &token.token, token.expire_at);
+        }
+
+        Ok(token.token)
+    }
+
     pub fn create_token(
         &self,
         member: &Member,
@@ -99,7 +137,7 @@ impl MotherduckClient {
             .header("Content-Type", "application/json")
             .header("Accept", "application/json")
             .send_json(serde_json::json!({
-                "ttl": ttl.unwrap_or_else(|| Duration::from_secs(300)).as_secs(),
+                "ttl": ttl.unwrap_or(DEFAULT_TTL).as_secs(),
                 "name": format!("{}-{}", USER_AGENT, OffsetDateTime::now_utc().unix_timestamp()),
                 "token_type": token_type
             }))
@@ -148,6 +186,14 @@ impl TokenType {
             TokenType::ReadScaling
         } else {
             TokenType::ReadWrite
+        }
+    }
+
+    /// Stable string used as the cache key; matches the serde renames.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TokenType::ReadWrite => "read_write",
+            TokenType::ReadScaling => "read_scaling",
         }
     }
 }

@@ -12,7 +12,9 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 mod motherduck_client;
+mod token_cache;
 use motherduck_client::*;
+use token_cache::TokenCache;
 
 #[derive(Parser, Debug)]
 #[command(name = "hq")]
@@ -143,12 +145,18 @@ enum OutputLine {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
+    // Best-effort: if the cache can't be opened we simply mint fresh tokens.
+    let cache = TokenCache::open_default()
+        .ok()
+        .map(|c| std::sync::Arc::new(std::sync::Mutex::new(c)));
+
     let client = MotherduckClient::builder()
         .admin_token(
             std::env::var("motherduck_token")
                 .context("motherduck_token environment variable not set")?,
         )
         .region(args.region.clone())
+        .maybe_cache(cache)
         .build();
 
     match args.command {
@@ -185,9 +193,9 @@ async fn main() -> Result<()> {
 
             let member = client.get_member_by_name(&service_account)?;
 
-            let token = client.create_token(&member, TokenType::from_read_only(read_only), None)?;
+            let token = client.token_for(&member, TokenType::from_read_only(read_only), None)?;
 
-            println!("export motherduck_token={}", token.token);
+            println!("export motherduck_token={}", token);
             println!("export motherduck_user={}", member.name);
         }
         Command::DuckDb {
@@ -197,7 +205,7 @@ async fn main() -> Result<()> {
             extra_args,
         } => {
             let member = client.get_member_by_name(&service_account)?;
-            let token = client.create_token(&member, TokenType::from_read_only(read_only), None)?;
+            let token = client.token_for(&member, TokenType::from_read_only(read_only), None)?;
 
             let err = std::process::Command::new("duckdb")
                 .arg(if database_is_username {
@@ -207,7 +215,7 @@ async fn main() -> Result<()> {
                 })
                 .args(extra_args)
                 .env("motherduck_user", &member.name)
-                .env("motherduck_token", token.token)
+                .env("motherduck_token", token)
                 .exec();
 
             return Err(err).context("exec duckdb");
@@ -218,7 +226,7 @@ async fn main() -> Result<()> {
             read_only,
         } => {
             let member = client.get_member_by_name(&service_account)?;
-            let token = client.create_token(&member, TokenType::from_read_only(read_only), None)?;
+            let token = client.token_for(&member, TokenType::from_read_only(read_only), None)?;
 
             // Fall back to /bin/sh when $SHELL is not set (e.g. in some cron/CI contexts).
             let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
@@ -232,7 +240,7 @@ async fn main() -> Result<()> {
 
             let err = std::process::Command::new(&shell)
                 .env("motherduck_user", &member.name)
-                .env("motherduck_token", token.token)
+                .env("motherduck_token", token)
                 .env("motherduck_database", &database)
                 .exec();
 
@@ -288,12 +296,12 @@ async fn main() -> Result<()> {
 
             // List the service account's databases by shelling out to duckdb
             // with a short-lived token for that account.
-            let list_token = client.create_token(&member, TokenType::ReadScaling, None)?;
+            let list_token = client.token_for(&member, TokenType::ReadScaling, None)?;
             let rows = duckdb_query_json(
                 "select alias from md_all_databases() where type = 'motherduck'",
                 &[
                     ("motherduck_user", &member.name),
-                    ("motherduck_token", &list_token.token),
+                    ("motherduck_token", &list_token),
                 ],
             )
             .with_context(|| format!("Listing databases for {}", member.name))?;
@@ -477,7 +485,7 @@ impl Job {
     async fn perform(&self, output_sender: flume::Sender<OutputLine>) -> Result<()> {
         let token = self
             .client
-            .create_token(&self.member, self.token_type, None)?;
+            .token_for(&self.member, self.token_type, None)?;
 
         let (program, program_args) = self
             .command
@@ -488,7 +496,7 @@ impl Job {
         command
             .args(program_args)
             .env("motherduck_user", &self.member.name)
-            .env("motherduck_token", &token.token);
+            .env("motherduck_token", &token);
         for (key, value) in &self.extra_env {
             command.env(key, value);
         }
