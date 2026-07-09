@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use bon::Builder;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, time::Duration};
@@ -42,7 +42,8 @@ impl MotherduckClient {
             .agent
             .get(self.build_trpc_endpoint("org.members"))
             .header("Authorization", &self.auth_header())
-            .call()?
+            .call()
+            .context("org.members")?
             .body_mut()
             .read_json::<serde_json::Value>()?;
 
@@ -90,12 +91,10 @@ impl MotherduckClient {
         token_type: TokenType,
         ttl: Option<Duration>,
     ) -> Result<Token> {
+        let url = format!("https://api.motherduck.com/v1/users/{}/tokens", member.name);
         let token = self
             .agent
-            .post(&format!(
-                "https://api.motherduck.com/v1/users/{}/tokens",
-                member.name
-            ))
+            .post(&url)
             .header("Authorization", &self.auth_header())
             .header("Content-Type", "application/json")
             .header("Accept", "application/json")
@@ -103,7 +102,8 @@ impl MotherduckClient {
                 "ttl": ttl.unwrap_or_else(|| Duration::from_secs(300)).as_secs(),
                 "name": format!("{}-{}", USER_AGENT, OffsetDateTime::now_utc().unix_timestamp()),
                 "token_type": token_type
-            }))?
+            }))
+            .context(url)?
             .body_mut()
             .read_json::<Token>()?;
         Ok(token)

@@ -285,15 +285,12 @@ async fn main() -> Result<()> {
                 .compile_matcher();
 
             let member = client.get_member_by_name(&service_account)?;
-            let token_type = TokenType::from_read_only(read_only);
 
             // List the service account's databases by shelling out to duckdb
             // with a short-lived token for that account.
             let list_token = client.create_token(&member, TokenType::ReadScaling, None)?;
             let rows = duckdb_query_json(
-                "select database_name from duckdb_databases() \
-                 where internal = false and database_name <> 'memory' \
-                 order by database_name",
+                "select alias from md_all_databases() where type = 'motherduck'",
                 &[
                     ("motherduck_user", &member.name),
                     ("motherduck_token", &list_token.token),
@@ -303,7 +300,7 @@ async fn main() -> Result<()> {
 
             let databases: Vec<String> = rows
                 .iter()
-                .filter_map(|row| row.get("database_name"))
+                .filter_map(|row| row.get("alias"))
                 .filter_map(|name| name.as_str())
                 .map(|name| name.to_owned())
                 .filter(|name| glob.is_match(name))
@@ -318,6 +315,7 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
 
+            let token_type = TokenType::from_read_only(read_only);
             let jobs = databases
                 .into_iter()
                 .map(|database| Job {
