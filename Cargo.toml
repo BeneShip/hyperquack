@@ -4,6 +4,7 @@ version = "0.3.0"
 edition = "2024"
 authors = ["Jacob Elder <jacob.elder@paccurate.io>"]
 description = "HyperQuack: hyper-tenancy utilities for MotherDuck"
+repository = "https://github.com/BeneShip/hyperquack"
 
 [[bin]]
 name = "hq"

@@ -14,7 +14,6 @@ use crate::token_cache::TokenCache;
 #[builder(on(String, into))]
 pub struct MotherduckClient {
     pub admin_token: String,
-    pub region: String,
     #[builder(default = MotherduckClient::build_agent())]
     agent: Agent,
     /// Best-effort local token cache. `None` disables caching (e.g. when the
@@ -36,48 +35,59 @@ impl MotherduckClient {
             .into()
     }
 
-    fn build_trpc_endpoint(&self, endpoint: &str) -> String {
-        format!(
-            "https://api.{}.motherduck.com/mom/trpc/{}",
-            self.region, endpoint
-        )
-    }
-
     fn auth_header(&self) -> String {
         format!("Bearer {}", self.admin_token)
     }
 
-    pub fn get_org_members(&self) -> Result<Vec<Member>> {
-        let value: serde_json::Value = self
-            .agent
-            .get(self.build_trpc_endpoint("org.members"))
-            .header("Authorization", &self.auth_header())
-            .call()
-            .context("org.members")?
-            .body_mut()
-            .read_json::<serde_json::Value>()?;
+    /// List active (non-deprovisioned) org members via the official REST API,
+    /// following `next_page_token` until exhausted. `is_service_account`
+    /// filters server-side when set.
+    ///
+    /// https://motherduck.com/docs/key-tasks/service-accounts-guide/manage-service-accounts-and-tokens/#view-service-accounts
+    pub fn list_users(&self, is_service_account: Option<bool>) -> Result<Vec<Member>> {
+        let url = "https://api.motherduck.com/v1/users";
+        let mut members = Vec::new();
+        let mut page_token: Option<String> = None;
 
-        let pointer = "/result/data/orgMembers";
-        let members: Vec<Member> = serde_json::from_value(
-            value
-                .pointer(pointer)
-                .ok_or_else(|| anyhow::anyhow!("missing {} in response", pointer))?
-                .clone(),
-        )?;
+        loop {
+            let mut request = self
+                .agent
+                .get(url)
+                .header("Authorization", &self.auth_header())
+                .header("Accept", "application/json")
+                .query("is_deprovisioned", "false")
+                .query("limit", USERS_PAGE_LIMIT.to_string());
+            if let Some(is_service_account) = is_service_account {
+                request = request.query("is_service_account", is_service_account.to_string());
+            }
+            if let Some(token) = &page_token {
+                request = request.query("page_token", token);
+            }
+
+            let page = request
+                .call()
+                .context(url)?
+                .body_mut()
+                .read_json::<UsersPage>()
+                .context("Parsing /v1/users response")?;
+
+            members.extend(page.users);
+            match page.next_page_token {
+                Some(token) => page_token = Some(token),
+                None => break,
+            }
+        }
+
         Ok(members)
     }
 
     pub fn get_service_accounts(&self) -> Result<Vec<Member>> {
-        let members = self.get_org_members()?;
-        Ok(members
-            .into_iter()
-            .filter(|m| m.is_service_account)
-            .collect())
+        self.list_users(Some(true))
     }
 
     pub fn get_member_by_name(&self, name: &str) -> Result<Member> {
         let members: HashMap<String, Member> = self
-            .get_org_members()?
+            .list_users(None)?
             .into_iter()
             .map(|m| (m.name.clone(), m))
             .collect();
@@ -152,11 +162,28 @@ impl MotherduckClient {
 #[allow(unused)]
 pub struct Member {
     pub id: Uuid,
-    pub email: String,
+    /// The API calls this `username`; it is the name tokens are minted
+    /// against and what `motherduck_user` is set to.
+    #[serde(rename = "username")]
     pub name: String,
-    pub org_role: String,
+    pub email: String,
+    pub first_name: Option<String>,
+    pub last_name: Option<String>,
     pub is_service_account: bool,
+    pub is_deprovisioned: bool,
+    /// Only roles assigned directly; roles inherited via a custom role are omitted.
+    #[serde(default)]
+    pub roles: Vec<String>,
 }
+
+#[derive(Deserialize, Debug)]
+struct UsersPage {
+    users: Vec<Member>,
+    next_page_token: Option<String>,
+}
+
+/// The API's documented maximum page size.
+const USERS_PAGE_LIMIT: u32 = 1000;
 
 #[derive(Serialize, Deserialize, Debug)]
 #[allow(unused)]
@@ -195,5 +222,37 @@ impl TokenType {
             TokenType::ReadWrite => "read_write",
             TokenType::ReadScaling => "read_scaling",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_documented_users_page() {
+        let page: UsersPage = serde_json::from_value(serde_json::json!({
+            "users": [{
+                "id": "6a1f1c1e-1b3e-4b7a-9a43-5d6c2a6c9e10",
+                "username": "analytics_service_account",
+                "email": "sa@example.invalid",
+                "first_name": "Service",
+                "last_name": "Account",
+                "is_service_account": true,
+                "is_deprovisioned": false,
+                "roles": ["builder"]
+            }],
+            "total_count": 1,
+            "next_page_token": null
+        }))
+        .unwrap();
+
+        assert!(page.next_page_token.is_none());
+        let [member] = page.users.as_slice() else {
+            panic!("expected one user");
+        };
+        assert_eq!(member.name, "analytics_service_account");
+        assert!(member.is_service_account);
+        assert_eq!(member.roles, vec!["builder".to_string()]);
     }
 }

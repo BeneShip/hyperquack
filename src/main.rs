@@ -24,10 +24,6 @@ struct Args {
     #[arg(short, long, default_value_t = false)]
     verbose: bool,
 
-    /// MotherDuck region
-    #[arg(short, long, default_value = "us-east-1-aws")]
-    region: String,
-
     /// Subcommand to run
     #[command(subcommand)]
     command: Command,
@@ -155,7 +151,6 @@ async fn main() -> Result<()> {
             std::env::var("motherduck_token")
                 .context("motherduck_token environment variable not set")?,
         )
-        .region(args.region.clone())
         .maybe_cache(cache)
         .build();
 
