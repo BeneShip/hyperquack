@@ -133,6 +133,33 @@ impl MotherduckClient {
         Ok(token.token)
     }
 
+    /// Permanently delete `member`. MotherDuck revokes its tokens and deletes
+    /// the data it owns; there is no undo.
+    ///
+    /// https://motherduck.com/docs/key-tasks/service-accounts-guide/manage-service-accounts-and-tokens/
+    pub fn delete_user(&self, member: &Member) -> Result<()> {
+        let url = format!(
+            "https://api.motherduck.com/v1/users/{}",
+            urlencoding::encode(&member.name)
+        );
+        self.agent
+            .delete(&url)
+            .header("Authorization", &self.auth_header())
+            .header("Accept", "application/json")
+            .call()
+            .context(url)?;
+
+        // The server already revoked these; evict them so a later run against a
+        // recreated account of the same name doesn't hand out a dead token.
+        if let Some(cache) = &self.cache
+            && let Ok(cache) = cache.lock()
+        {
+            let _ = cache.forget(&member.name);
+        }
+
+        Ok(())
+    }
+
     pub fn create_token(
         &self,
         member: &Member,

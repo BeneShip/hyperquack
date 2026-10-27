@@ -129,6 +129,18 @@ impl TokenCache {
             .context("Writing cached token")?;
         Ok(())
     }
+
+    /// Drop every cached token for this account, regardless of type or expiry.
+    pub fn forget(&self, member_name: &str) -> Result<usize> {
+        let removed = self
+            .conn
+            .execute(
+                "DELETE FROM tokens WHERE member_name = ?1",
+                params![member_name],
+            )
+            .context("Forgetting cached tokens")?;
+        Ok(removed)
+    }
 }
 
 #[cfg(test)]

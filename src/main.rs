@@ -127,6 +127,18 @@ enum Command {
         read_only: bool,
     },
 
+    /// Permanently delete a service account.
+    ///
+    /// MotherDuck immediately revokes the account's tokens and deletes the data
+    /// it owns. This cannot be undone.
+    Delete {
+        service_account: String,
+
+        /// Skip the interactive confirmation (required when stdin is not a terminal)
+        #[arg(short, long, default_value_t = false)]
+        yes: bool,
+    },
+
     /// Create skeleton for use with `hq map`
     Init { name: String },
 }
@@ -289,25 +301,9 @@ async fn main() -> Result<()> {
 
             let member = client.get_member_by_name(&service_account)?;
 
-            // List the service account's databases by shelling out to duckdb
-            // with a short-lived token for that account.
             let list_token = client.token_for(&member, TokenType::ReadScaling, None)?;
-            let rows = duckdb_query_json(
-                "select alias from md_all_databases() where type = 'motherduck'",
-                &[
-                    ("motherduck_user", &member.name),
-                    ("motherduck_token", &list_token),
-                ],
-            )
-            .with_context(|| format!("Listing databases for {}", member.name))?;
-
-            let databases: Vec<String> = rows
-                .iter()
-                .filter_map(|row| row.get("alias"))
-                .filter_map(|name| name.as_str())
-                .map(|name| name.to_owned())
-                .filter(|name| glob.is_match(name))
-                .collect();
+            let mut databases = list_owned_databases(&member, &list_token)?;
+            databases.retain(|name| glob.is_match(name));
 
             if databases.is_empty() {
                 println!(
@@ -332,6 +328,43 @@ async fn main() -> Result<()> {
                 .collect();
 
             run_jobs(jobs, concurrency, args.verbose).await?;
+        }
+        Command::Delete {
+            service_account,
+            yes,
+        } => {
+            let member = client.get_member_by_name(&service_account)?;
+
+            // The users endpoint deletes humans too; this tool only manages
+            // service accounts, so never let a typo take out a person.
+            if !member.is_service_account {
+                anyhow::bail!(
+                    "{} is not a service account; refusing to delete",
+                    member.name
+                );
+            }
+
+            // Deletion destroys everything the account owns, so only allow it
+            // once there is nothing left to lose. Read-write rather than
+            // read-scaling: a lagging replica could miss freshly written rows.
+            let check_token = client.token_for(&member, TokenType::ReadWrite, None)?;
+            let tables = nonempty_tables(&member, &check_token)
+                .with_context(|| format!("Checking data owned by {}", member.name))?;
+            if !tables.is_empty() {
+                anyhow::bail!(
+                    "Refusing to delete {}: it owns {} non-empty table(s):\n  {}",
+                    member.name,
+                    tables.len(),
+                    tables.join("\n  ")
+                );
+            }
+
+            if !yes {
+                confirm_deletion(&member.name)?;
+            }
+
+            client.delete_user(&member)?;
+            eprintln!("Deleted service account {}", member.name);
         }
         Command::Init { name } => {
             let template = include_str!("../map_template.sh");
@@ -361,6 +394,142 @@ async fn main() -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Names of the MotherDuck databases `member` owns, including detached ones.
+/// Shares attached from other accounts are excluded.
+fn list_owned_databases(member: &Member, token: &str) -> Result<Vec<String>> {
+    let rows = duckdb_query_json(
+        "select alias from md_all_databases() where type = 'motherduck'",
+        &[
+            ("motherduck_user", &member.name),
+            ("motherduck_token", token),
+        ],
+    )
+    .with_context(|| format!("Listing databases for {}", member.name))?;
+
+    Ok(rows
+        .iter()
+        .filter_map(|row| row.get("alias"))
+        .filter_map(|name| name.as_str())
+        .map(|name| name.to_owned())
+        .collect())
+}
+
+/// Fully qualified names of every base table in `member`'s databases that
+/// holds at least one row.
+fn nonempty_tables(member: &Member, token: &str) -> Result<Vec<String>> {
+    let env = [
+        ("motherduck_user", member.name.as_str()),
+        ("motherduck_token", token),
+    ];
+
+    let databases = list_owned_databases(member, token)?;
+    if databases.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Detached databases are invisible to duckdb_tables() and unqueryable
+    // until attached, and each duckdb invocation starts from a fresh session.
+    let attach: String = databases
+        .iter()
+        .map(|d| {
+            format!(
+                "ATTACH IF NOT EXISTS {};\n",
+                sql_string(&format!("md:{}", d))
+            )
+        })
+        .collect();
+
+    let listing = format!(
+        "{attach}select database_name, schema_name, table_name from duckdb_tables() \
+         where not internal and not temporary and database_name in ({})",
+        databases
+            .iter()
+            .map(|d| sql_string(d))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let rows = duckdb_query_json(&listing, &env).context("Listing tables")?;
+
+    let tables: Vec<[String; 3]> = rows
+        .iter()
+        .filter_map(|row| {
+            let field = |key| row.get(key)?.as_str().map(str::to_owned);
+            Some([
+                field("database_name")?,
+                field("schema_name")?,
+                field("table_name")?,
+            ])
+        })
+        .collect();
+    if tables.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // estimated_size is only an estimate, and a wrong "0" here would let real
+    // data be destroyed, so probe each table for an actual row instead.
+    let probe = format!(
+        "{attach}{}",
+        tables
+            .iter()
+            .map(|parts| {
+                let qualified = parts
+                    .iter()
+                    .map(|p| sql_ident(p))
+                    .collect::<Vec<_>>()
+                    .join(".");
+                format!(
+                    "select {} as name where exists (select 1 from {})",
+                    sql_string(&qualified),
+                    qualified
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\nunion all\n")
+    );
+    let rows = duckdb_query_json(&probe, &env).context("Probing tables for rows")?;
+
+    Ok(rows
+        .iter()
+        .filter_map(|row| row.get("name")?.as_str().map(str::to_owned))
+        .collect())
+}
+
+fn sql_string(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+fn sql_ident(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
+}
+
+/// Require the operator to retype the account name. A y/n prompt is too easy to
+/// answer on autopilot for an irreversible delete.
+fn confirm_deletion(name: &str) -> Result<()> {
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!(
+            "Refusing to delete {} without confirmation; pass --yes",
+            name
+        );
+    }
+
+    eprintln!(
+        "{} This permanently deletes service account {} and all data it owns.",
+        style("WARNING:").red().bold(),
+        style(name).bold()
+    );
+    eprint!("Type the account name to confirm: ");
+
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .context("Reading confirmation")?;
+
+    if answer.trim() != name {
+        anyhow::bail!("Confirmation did not match; nothing deleted");
+    }
     Ok(())
 }
 
@@ -478,9 +647,7 @@ struct Job {
 
 impl Job {
     async fn perform(&self, output_sender: flume::Sender<OutputLine>) -> Result<()> {
-        let token = self
-            .client
-            .token_for(&self.member, self.token_type, None)?;
+        let token = self.client.token_for(&self.member, self.token_type, None)?;
 
         let (program, program_args) = self
             .command
