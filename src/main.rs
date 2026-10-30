@@ -153,6 +153,11 @@ enum OutputLine {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
+    // `init` only writes a local file, so it must work before credentials exist.
+    if let Command::Init { name } = &args.command {
+        return init_script(name);
+    }
+
     // Best-effort: if the cache can't be opened we simply mint fresh tokens.
     let cache = TokenCache::open_default()
         .ok()
